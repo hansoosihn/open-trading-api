@@ -9,7 +9,7 @@ import logging
 
 import pandas as pd
 
-sys.path.extend(['../..', '.'])  # kis_auth 파일 경로 추가
+sys.path.extend(['D:\\AutoStock\\examples_llm\\', '.'])  # kis_auth 파일 경로 추가
 import kis_auth as ka
 from auth_token import auth_token
 

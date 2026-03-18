@@ -131,6 +131,7 @@ graph LR
 |----------|------|------|
 | `strategy_builder/` | 전략 설계 + 시그널 생성 | 80개 기술지표, 10개 프리셋 전략, BUY/SELL/HOLD 신호 ([README](strategy_builder/README.md)) |
 | `backtester/` | 과거 검증 + 파라미터 최적화 | Docker 기반 QuantConnect Lean, HTML 리포트 ([README](backtester/README.md)) |
+| `home_trading_system/` | 홈트레이딩 시스템 샘플 | 인증, 설정 로딩, 주문 미리보기, CLI 데모 ([README](home_trading_system/README.md)) |
 | `MCP/` | AI 도구 연결 | KIS Code Assistant + Trading MCP ([README](MCP/README.MD)) |
 
 #### 10개 프리셋 전략
