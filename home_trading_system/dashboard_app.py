@@ -17,14 +17,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import QEvent, Qt, QTimer
 from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
-    QDoubleSpinBox,
     QFrame,
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -33,8 +31,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSpinBox,
-    QSplitter,
+    QSlider,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
@@ -109,6 +106,13 @@ class AutoStockHts(QMainWindow):
         self.live_updates = True
         self.active_code = "005930"
         self.orders: List[Dict[str, str]] = []
+        self.book_order_qty: Dict[str, Dict[str, Dict[int, int]]] = {}
+        self.order_book_prices: Dict[int, int] = {}
+        self.order_book_anchor_prices: Dict[str, int] = {}
+        self.order_book_slider_values: Dict[str, int] = {}
+        self.order_book_rows = 40
+        self.order_cancel_drag = None
+        self.skip_next_order_book_click = False
         self.positions: Dict[str, Dict[str, int | str]] = {
             "005930": {"name": "삼성전자", "qty": 12, "avg": 74200},
             "035420": {"name": "NAVER", "qty": 8, "avg": 183000},
@@ -142,8 +146,8 @@ class AutoStockHts(QMainWindow):
             "035720": ("카카오", 43600),
             "005380": ("현대차", 256000),
             "068270": ("셀트리온", 181500),
-            "051910": ("LG화학", 346000),
-            "207940": ("삼성바이오로직스", 894000),
+            "122630": ("KODEX레버리지", 346000),
+            "252670": ("KODEX200선물인버스2X", 894000),
         }
         stocks: Dict[str, StockState] = {}
         for code, (name, price) in seed.items():
@@ -168,7 +172,7 @@ class AutoStockHts(QMainWindow):
                 background: {HtsColors.BG};
                 color: {HtsColors.TEXT};
                 font-family: Malgun Gothic, Segoe UI, Arial;
-                font-size: 10pt;
+                font-size: 8pt;
             }}
             QGroupBox {{
                 background: {HtsColors.PANEL};
@@ -196,14 +200,16 @@ class AutoStockHts(QMainWindow):
                 color: {HtsColors.TEXT};
                 border: 1px solid {HtsColors.GRID};
                 padding: 4px;
+                font-size: 8pt;
                 font-weight: 600;
             }}
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {{
+            QLineEdit, QComboBox, QTextEdit {{
                 background: #0f172a;
                 color: {HtsColors.TEXT};
                 border: 1px solid {HtsColors.GRID};
                 border-radius: 4px;
                 padding: 4px;
+                font-size: 8pt;
             }}
             QPushButton {{
                 background: #334155;
@@ -211,6 +217,7 @@ class AutoStockHts(QMainWindow):
                 border: 1px solid #475569;
                 border-radius: 4px;
                 padding: 5px 8px;
+                font-size: 8pt;
             }}
             QPushButton:hover {{ background: #475569; }}
             QToolBar {{
@@ -228,6 +235,7 @@ class AutoStockHts(QMainWindow):
                 color: {HtsColors.MUTED};
                 padding: 8px 14px;
                 border: 1px solid {HtsColors.GRID};
+                font-size: 8pt;
             }}
             QTabBar::tab:selected {{
                 background: {HtsColors.PANEL_2};
@@ -243,6 +251,7 @@ class AutoStockHts(QMainWindow):
         root = QWidget()
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(6)
 
         self.market_strip = QLabel()
         self.market_strip.setFrameShape(QFrame.StyledPanel)
@@ -251,17 +260,14 @@ class AutoStockHts(QMainWindow):
         )
         root_layout.addWidget(self.market_strip)
 
-        main_splitter = QSplitter(Qt.Horizontal)
-        main_splitter.addWidget(self._build_left_panel())
-        main_splitter.addWidget(self._build_center_panel())
-        main_splitter.addWidget(self._build_right_panel())
-        main_splitter.setSizes([310, 770, 380])
-        root_layout.addWidget(main_splitter, 1)
-
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setFixedHeight(130)
-        root_layout.addWidget(self.log_box)
+        self.main_tabs = QTabWidget()
+        self.main_tabs.addTab(self._build_order_book_tab(), "호가/주문")
+        self.main_tabs.addTab(self._build_account_panel(), "계좌/잔고")
+        self.main_tabs.addTab(self._build_watchlist_tab(), "관심종목")
+        self.main_tabs.addTab(self._build_news_tab(), "뉴스/알림")
+        self.main_tabs.addTab(self._build_log_tab(), "로그창")
+        self.main_tabs.addTab(self._build_orders_tab(), "주문/체결")
+        root_layout.addWidget(self.main_tabs, 1)
 
         self.setCentralWidget(root)
 
@@ -271,7 +277,7 @@ class AutoStockHts(QMainWindow):
         self.addToolBar(toolbar)
 
         title = QLabel("  AutoStock HTS  ")
-        title.setFont(QFont("Malgun Gothic", 13, QFont.Bold))
+        title.setFont(QFont("Malgun Gothic", 8, QFont.Bold))
         toolbar.addWidget(title)
 
         toolbar.addSeparator()
@@ -300,103 +306,158 @@ class AutoStockHts(QMainWindow):
         self.clock_label = QLabel()
         toolbar.addWidget(self.clock_label)
 
-    def _build_left_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
+    def _compact_light_table_style(self) -> str:
+        return """
+            QTableWidget {
+                background: #f8fafc;
+                color: #111827;
+                gridline-color: #cbd5e1;
+                selection-background-color: #334155;
+                selection-color: #ffffff;
+                border: 1px solid #94a3b8;
+                font-size: 8pt;
+            }
+            QTableWidget::item {
+                padding: 0px 2px;
+                font-size: 8pt;
+            }
+            QHeaderView::section {
+                background: #e5e7eb;
+                color: #111827;
+                border: 1px solid #cbd5e1;
+                padding: 1px 2px;
+                font-size: 8pt;
+                font-weight: 400;
+            }
+            """
 
-        search_group = QGroupBox("종목 검색")
-        search_layout = QGridLayout(search_group)
-        self.symbol_input = QLineEdit(self.active_code)
-        self.symbol_input.setPlaceholderText("종목코드 예: 005930")
-        self.search_btn = QPushButton("조회/추가")
-        search_layout.addWidget(QLabel("코드"), 0, 0)
-        search_layout.addWidget(self.symbol_input, 0, 1)
-        search_layout.addWidget(self.search_btn, 0, 2)
-        layout.addWidget(search_group)
+    def _build_order_book_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(4)
+        book_columns = [56, 74, 66, 58, 74, 56]
+        book_width = sum(book_columns) + 2
 
-        watch_group = QGroupBox("관심종목")
-        watch_layout = QVBoxLayout(watch_group)
+        order_top = QWidget()
+        order_top.setFixedWidth(book_width)
+        order_top_layout = QHBoxLayout(order_top)
+        order_top_layout.setContentsMargins(0, 0, 0, 0)
+        order_top_layout.setSpacing(2)
+
+        self.order_account_combo = QComboBox()
+        self.order_account_combo.addItem(self.account_no)
+        self.order_account_combo.setFixedSize(82, 22)
+        self.order_password_input = QLineEdit()
+        self.order_password_input.setEchoMode(QLineEdit.Password)
+        self.order_password_input.setPlaceholderText("계좌비밀번호")
+        self.order_password_input.setFixedSize(88, 22)
+        self.order_symbol_combo = QComboBox()
+        self.order_symbol_combo.setEditable(True)
+        self.order_symbol_combo.setFixedSize(84, 22)
+        for code, stock in self.stocks.items():
+            self.order_symbol_combo.addItem(code, stock.name)
+        self.order_symbol_combo.setCurrentText(self.active_code)
+        self.order_symbol_name = QLabel()
+        self.order_symbol_name.setFrameShape(QFrame.StyledPanel)
+        self.order_symbol_name.setFixedSize(124, 22)
+        self.order_symbol_name.setAlignment(Qt.AlignCenter)
+        self.order_symbol_name.setStyleSheet(
+            "background:#f8fafc; color:#111827; padding:2px; font-size:8pt;"
+        )
+
+        order_top_layout.addWidget(self.order_account_combo)
+        order_top_layout.addWidget(self.order_password_input)
+        order_top_layout.addWidget(self.order_symbol_combo)
+        order_top_layout.addWidget(self.order_symbol_name)
+        layout.addWidget(order_top, 0, Qt.AlignLeft)
+
+        self.order_holdings_table = QTableWidget(4, 4)
+        self.order_holdings_table.setHorizontalHeaderLabels(["종목명", "보유량", "현재가", "평가금액"])
+        self.order_holdings_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.order_holdings_table.verticalHeader().setVisible(False)
+        self.order_holdings_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.order_holdings_table.verticalHeader().setMinimumSectionSize(16)
+        self.order_holdings_table.verticalHeader().setDefaultSectionSize(16)
+        self.order_holdings_table.horizontalHeader().setFixedHeight(18)
+        self.order_holdings_table.setFixedHeight(84)
+        self.order_holdings_table.setFixedWidth(book_width)
+        self.order_holdings_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.order_holdings_table.setFont(QFont("Malgun Gothic", 8))
+        self.order_holdings_table.horizontalHeader().setFont(QFont("Malgun Gothic", 8))
+        self.order_holdings_table.setStyleSheet(self._compact_light_table_style())
+        for col, width in enumerate([110, 64, 86, 124]):
+            self.order_holdings_table.setColumnWidth(col, width)
+        layout.addWidget(self.order_holdings_table, 0, Qt.AlignLeft)
+
+        book_layout = QHBoxLayout()
+        book_layout.setContentsMargins(0, 0, 0, 0)
+        book_layout.setSpacing(2)
+
+        self.order_book_table = QTableWidget(self.order_book_rows, 6)
+        self.order_book_table.setHorizontalHeaderLabels(
+            ["KRX매도", "잔량", "호가", "등락율", "잔량", "KRX매수"]
+        )
+        self.order_book_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.order_book_table.verticalHeader().setVisible(False)
+        self.order_book_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.order_book_table.verticalHeader().setMinimumSectionSize(16)
+        self.order_book_table.verticalHeader().setDefaultSectionSize(16)
+        self.order_book_table.horizontalHeader().setFixedHeight(18)
+        self.order_book_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.order_book_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.order_book_table.setFixedHeight(660)
+        self.order_book_table.setFont(QFont("Malgun Gothic", 8))
+        self.order_book_table.horizontalHeader().setFont(QFont("Malgun Gothic", 8))
+        self.order_book_table.setStyleSheet(self._compact_light_table_style())
+        for col, width in enumerate(book_columns):
+            self.order_book_table.setColumnWidth(col, width)
+        self.order_book_table.setFixedWidth(book_width)
+        self.order_book_table.viewport().installEventFilter(self)
+        book_layout.addWidget(self.order_book_table, 0, Qt.AlignLeft | Qt.AlignTop)
+
+        self.order_book_slider = QSlider(Qt.Vertical)
+        self.order_book_slider.setRange(-200, 200)
+        self.order_book_slider.setValue(0)
+        self.order_book_slider.setSingleStep(1)
+        self.order_book_slider.setPageStep(5)
+        self.order_book_slider.setToolTip("호가 가격대를 수동으로 이동")
+        book_layout.addWidget(self.order_book_slider, 0, Qt.AlignLeft | Qt.AlignTop)
+        book_layout.addStretch(1)
+
+        layout.addLayout(book_layout, 1)
+        return widget
+
+    def _build_watchlist_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
         self.watch_table = QTableWidget(0, 6)
         self.watch_table.setHorizontalHeaderLabels(["코드", "종목명", "현재가", "대비", "등락률", "거래량"])
         self.watch_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.watch_table.verticalHeader().setVisible(False)
         self.watch_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.watch_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        watch_layout.addWidget(self.watch_table)
-        layout.addWidget(watch_group, 1)
+        layout.addWidget(self.watch_table)
+        return widget
 
-        news_group = QGroupBox("뉴스/알림")
-        news_layout = QVBoxLayout(news_group)
+    def _build_news_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
         self.news_box = QTextEdit()
         self.news_box.setReadOnly(True)
         self.news_box.setText(
             "09:00 장 시작\n09:05 삼성전자 외국인 순매수 유입\n"
             "09:12 반도체 업종 강세\n09:30 데모 모드: 주문은 실제 전송되지 않음"
         )
-        news_layout.addWidget(self.news_box)
-        layout.addWidget(news_group)
-        return panel
-
-    def _build_center_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        quote_group = QGroupBox("현재 종목")
-        quote_layout = QGridLayout(quote_group)
-        self.quote_name = QLabel()
-        self.quote_name.setFont(QFont("Malgun Gothic", 18, QFont.Bold))
-        self.quote_price = QLabel()
-        self.quote_price.setFont(QFont("Consolas", 24, QFont.Bold))
-        self.quote_change = QLabel()
-        self.quote_ohlv = QLabel()
-        quote_layout.addWidget(self.quote_name, 0, 0)
-        quote_layout.addWidget(self.quote_price, 0, 1, Qt.AlignRight)
-        quote_layout.addWidget(self.quote_change, 1, 0)
-        quote_layout.addWidget(self.quote_ohlv, 1, 1, Qt.AlignRight)
-        layout.addWidget(quote_group)
-
-        tabs = QTabWidget()
-        tabs.addTab(self._build_order_book_tab(), "호가/주문")
-        tabs.addTab(self._build_chart_tab(), "차트")
-        tabs.addTab(self._build_orders_tab(), "주문/체결")
-        layout.addWidget(tabs, 1)
-        return panel
-
-    def _build_order_book_tab(self) -> QWidget:
-        widget = QWidget()
-        layout = QHBoxLayout(widget)
-
-        self.order_book_table = QTableWidget(20, 5)
-        self.order_book_table.setHorizontalHeaderLabels(
-            ["매도주문", "매도잔량", "호가", "매수잔량", "매수주문"]
-        )
-        self.order_book_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.order_book_table.verticalHeader().setVisible(False)
-        self.order_book_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        layout.addWidget(self.order_book_table, 2)
-
-        detail = QGroupBox("종목 상세")
-        detail_layout = QGridLayout(detail)
-        self.detail_labels: Dict[str, QLabel] = {}
-        for row, key in enumerate(["시가", "고가", "저가", "전일종가", "거래량", "주문가능"]):
-            detail_layout.addWidget(QLabel(key), row, 0)
-            self.detail_labels[key] = QLabel("-")
-            self.detail_labels[key].setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            detail_layout.addWidget(self.detail_labels[key], row, 1)
-        layout.addWidget(detail, 1)
+        layout.addWidget(self.news_box)
         return widget
 
-    def _build_chart_tab(self) -> QWidget:
+    def _build_log_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        self.chart_table = QTableWidget(0, 2)
-        self.chart_table.setHorizontalHeaderLabels(["Tick", "Price"])
-        self.chart_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.chart_table.verticalHeader().setVisible(False)
-        layout.addWidget(QLabel("간이 틱 차트 데이터"))
-        layout.addWidget(self.chart_table)
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        layout.addWidget(self.log_box)
         return widget
 
     def _build_orders_tab(self) -> QWidget:
@@ -412,61 +473,12 @@ class AutoStockHts(QMainWindow):
         layout.addWidget(self.orders_table)
         return widget
 
-    def _build_right_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        layout.addWidget(self._build_order_ticket())
-        layout.addWidget(self._build_account_panel())
-        return panel
-
-    def _build_order_ticket(self) -> QGroupBox:
-        group = QGroupBox("주문 입력")
-        layout = QGridLayout(group)
-
-        self.ticket_code = QLineEdit(self.active_code)
-        self.ticket_name = QLabel()
-        self.side_combo = QComboBox()
-        self.side_combo.addItems(["매수", "매도"])
-        self.qty_spin = QSpinBox()
-        self.qty_spin.setRange(1, 1_000_000)
-        self.qty_spin.setValue(10)
-        self.price_spin = QDoubleSpinBox()
-        self.price_spin.setRange(1, 100_000_000)
-        self.price_spin.setDecimals(0)
-        self.price_spin.setSingleStep(100)
-        self.order_type = QComboBox()
-        self.order_type.addItems(["지정가", "시장가"])
-
-        layout.addWidget(QLabel("종목"), 0, 0)
-        layout.addWidget(self.ticket_code, 0, 1)
-        layout.addWidget(self.ticket_name, 0, 2)
-        layout.addWidget(QLabel("구분"), 1, 0)
-        layout.addWidget(self.side_combo, 1, 1, 1, 2)
-        layout.addWidget(QLabel("수량"), 2, 0)
-        layout.addWidget(self.qty_spin, 2, 1, 1, 2)
-        layout.addWidget(QLabel("가격"), 3, 0)
-        layout.addWidget(self.price_spin, 3, 1, 1, 2)
-        layout.addWidget(QLabel("유형"), 4, 0)
-        layout.addWidget(self.order_type, 4, 1, 1, 2)
-
-        self.buy_btn = QPushButton("매수 주문")
-        self.buy_btn.setStyleSheet(f"background:{HtsColors.BUY}; font-weight:bold;")
-        self.sell_btn = QPushButton("매도 주문")
-        self.sell_btn.setStyleSheet(f"background:{HtsColors.SELL}; font-weight:bold;")
-        self.cancel_btn = QPushButton("입력 초기화")
-        layout.addWidget(self.buy_btn, 5, 0, 1, 3)
-        layout.addWidget(self.sell_btn, 6, 0, 1, 3)
-        layout.addWidget(self.cancel_btn, 7, 0, 1, 3)
-        return group
-
     def _build_account_panel(self) -> QGroupBox:
         group = QGroupBox("계좌/잔고")
         layout = QVBoxLayout(group)
 
         self.account_summary = QLabel()
-        self.account_summary.setStyleSheet("font-size:12pt; font-weight:bold;")
+        self.account_summary.setStyleSheet("font-size:8pt; font-weight:400;")
         layout.addWidget(self.account_summary)
 
         self.portfolio_table = QTableWidget(0, 6)
@@ -480,12 +492,12 @@ class AutoStockHts(QMainWindow):
     def _wire_events(self) -> None:
         self.start_btn.clicked.connect(self._start_updates)
         self.stop_btn.clicked.connect(self._stop_updates)
-        self.search_btn.clicked.connect(self._search_or_add_symbol)
         self.watch_table.itemSelectionChanged.connect(self._select_watch_symbol)
-        self.buy_btn.clicked.connect(lambda: self._submit_ticket("매수"))
-        self.sell_btn.clicked.connect(lambda: self._submit_ticket("매도"))
-        self.cancel_btn.clicked.connect(self._reset_ticket)
-        self.ticket_code.returnPressed.connect(self._apply_ticket_symbol)
+        self.order_book_table.cellClicked.connect(self._handle_order_book_click)
+        self.order_book_slider.valueChanged.connect(self._handle_order_book_slider)
+        self.order_symbol_combo.activated.connect(lambda _: self._apply_order_symbol())
+        if self.order_symbol_combo.lineEdit() is not None:
+            self.order_symbol_combo.lineEdit().returnPressed.connect(self._apply_order_symbol)
 
     def _start_updates(self) -> None:
         self.live_updates = True
@@ -498,7 +510,7 @@ class AutoStockHts(QMainWindow):
         self.log("시스템", "실시간 업데이트 OFF")
 
     def _search_or_add_symbol(self) -> None:
-        code = self.symbol_input.text().strip().upper()
+        code = self.order_symbol_combo.currentText().strip().upper()
         if not code:
             return
         if code not in self.stocks:
@@ -515,6 +527,7 @@ class AutoStockHts(QMainWindow):
                 history=[base],
             )
             self.log("관심종목", f"{code} 추가")
+            self._sync_order_symbol_options()
         self._set_active_symbol(code)
         self._refresh_all()
 
@@ -526,12 +539,51 @@ class AutoStockHts(QMainWindow):
         if item:
             self._set_active_symbol(item.text())
 
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            hasattr(self, "order_book_table")
+            and watched is self.order_book_table.viewport()
+        ):
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self.order_cancel_drag = self._order_cancel_drag_candidate(event.pos())
+            elif event.type() == QEvent.MouseMove and self.order_cancel_drag:
+                if event.buttons() & Qt.LeftButton and not self.order_cancel_drag["rect"].contains(event.pos()):
+                    drag = self.order_cancel_drag
+                    self.order_cancel_drag = None
+                    self.skip_next_order_book_click = True
+                    self._request_book_order_cancel(
+                        str(drag["code"]),
+                        str(drag["side"]),
+                        int(drag["price"]),
+                        int(drag["qty"]),
+                    )
+                    return True
+            elif event.type() == QEvent.MouseButtonRelease:
+                self.order_cancel_drag = None
+            elif event.type() == QEvent.Wheel:
+                delta = event.angleDelta().y()
+                if delta:
+                    steps = max(1, abs(delta) // 120)
+                    direction = 1 if delta > 0 else -1
+                    self.order_book_slider.setValue(self.order_book_slider.value() + direction * steps)
+                return True
+        return super().eventFilter(watched, event)
+
     def _apply_ticket_symbol(self) -> None:
-        code = self.ticket_code.text().strip().upper()
+        code = self.order_symbol_combo.currentText().strip().upper()
         if code in self.stocks:
             self._set_active_symbol(code)
         else:
-            self.symbol_input.setText(code)
+            self._search_or_add_symbol()
+
+    def _apply_order_symbol(self) -> None:
+        code = self.order_symbol_combo.currentText().strip().upper()
+        if not code:
+            return
+        if code in self.stocks:
+            self._set_active_symbol(code)
+            self._refresh_all()
+        else:
             self._search_or_add_symbol()
 
     def _set_active_symbol(self, code: str) -> None:
@@ -539,21 +591,31 @@ class AutoStockHts(QMainWindow):
             return
         self.active_code = code
         stock = self.stocks[code]
-        self.ticket_code.setText(code)
-        self.ticket_name.setText(stock.name)
-        self.price_spin.setValue(stock.price)
+        self.order_book_anchor_prices.setdefault(code, stock.price)
+        self.order_book_slider_values.setdefault(code, 0)
+        self._sync_order_symbol_options()
+        self.order_symbol_combo.blockSignals(True)
+        self.order_symbol_combo.setCurrentText(code)
+        self.order_symbol_combo.blockSignals(False)
+        self.order_symbol_name.setText(stock.name)
         self._refresh_quote_panel()
         self._refresh_order_book()
-        self._refresh_chart()
+
+    def _sync_order_symbol_options(self) -> None:
+        if not hasattr(self, "order_symbol_combo"):
+            return
+        existing = {
+            self.order_symbol_combo.itemText(index)
+            for index in range(self.order_symbol_combo.count())
+        }
+        for code, stock in self.stocks.items():
+            if code not in existing:
+                self.order_symbol_combo.addItem(code, stock.name)
 
     def _reset_ticket(self) -> None:
         stock = self.stocks[self.active_code]
-        self.ticket_code.setText(stock.code)
-        self.ticket_name.setText(stock.name)
-        self.side_combo.setCurrentIndex(0)
-        self.qty_spin.setValue(10)
-        self.price_spin.setValue(stock.price)
-        self.order_type.setCurrentIndex(0)
+        self.order_symbol_combo.setCurrentText(stock.code)
+        self.order_symbol_name.setText(stock.name)
 
     def _tick_market(self) -> None:
         self.clock_label.setText(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -576,8 +638,8 @@ class AutoStockHts(QMainWindow):
         self._refresh_watchlist()
         self._refresh_quote_panel()
         self._refresh_order_book()
-        self._refresh_chart()
         self._refresh_portfolio()
+        self._refresh_order_holdings()
         self._refresh_account_summary()
 
     def _refresh_market_strip(self) -> None:
@@ -610,60 +672,55 @@ class AutoStockHts(QMainWindow):
 
     def _refresh_quote_panel(self) -> None:
         stock = self.stocks[self.active_code]
-        self.quote_name.setText(f"{stock.name} ({stock.code})")
-        self.quote_price.setText(f"{stock.price:,}")
-        self.quote_change.setText(f"대비 {stock.change:+,} / {stock.change_rate:+.2f}%")
-        self.quote_change.setStyleSheet(
-            f"color:{HtsColors.BUY if stock.change >= 0 else HtsColors.SELL};"
-        )
-        self.quote_ohlv.setText(
-            f"시 {stock.open_price:,}  고 {stock.high_price:,}  저 {stock.low_price:,}  거래량 {stock.volume:,}"
-        )
-        self.ticket_name.setText(stock.name)
-        if self.ticket_code.text().strip().upper() == stock.code:
-            self.price_spin.setValue(stock.price)
-        self.detail_labels["시가"].setText(f"{stock.open_price:,}")
-        self.detail_labels["고가"].setText(f"{stock.high_price:,}")
-        self.detail_labels["저가"].setText(f"{stock.low_price:,}")
-        self.detail_labels["전일종가"].setText(f"{stock.previous_close:,}")
-        self.detail_labels["거래량"].setText(f"{stock.volume:,}")
-        self.detail_labels["주문가능"].setText(f"{self.cash:,} 원")
+        self.order_symbol_name.setText(stock.name)
 
     def _refresh_order_book(self) -> None:
         stock = self.stocks[self.active_code]
         unit = self._price_unit(stock.price)
-        mid = 9
-        for row in range(20):
+        if self.order_book_table.rowCount() != self.order_book_rows:
+            self.order_book_table.setRowCount(self.order_book_rows)
+        rows = self.order_book_table.rowCount()
+        mid = rows // 2 - 1
+        order_qty = self.book_order_qty.get(stock.code, {})
+        slider_value = self.order_book_slider_values.get(stock.code, 0)
+        self.order_book_slider.blockSignals(True)
+        self.order_book_slider.setValue(slider_value)
+        self.order_book_slider.blockSignals(False)
+        center_price = self._order_book_center_price(stock.code, stock.price, unit)
+        previous_close_price = max(unit, round(stock.previous_close / unit) * unit)
+        current_price_level = max(unit, round(stock.price / unit) * unit)
+        self.order_book_prices = {}
+        for row in range(rows):
             level = mid - row
-            price = stock.price + level * unit
-            ask_qty = random.randint(50, 3000) if row <= mid else ""
-            bid_qty = random.randint(50, 3000) if row >= mid else ""
+            price = max(unit, center_price + level * unit)
+            self.order_book_prices[row] = price
+            show_ask_qty = current_price_level < price <= current_price_level + unit * 10
+            show_bid_qty = current_price_level - unit * 9 <= price <= current_price_level
+            ask_qty = random.randint(50, 3000) if show_ask_qty else ""
+            bid_qty = random.randint(50, 3000) if show_bid_qty else ""
+            sell_order_qty = order_qty.get("매도", {}).get(price, 0)
+            buy_order_qty = order_qty.get("매수", {}).get(price, 0)
+            change = price - stock.previous_close
+            change_rate = change / stock.previous_close * 100 if stock.previous_close else 0.0
+            is_previous_close = price == previous_close_price
 
-            sell_btn = QPushButton("매도")
-            sell_btn.setStyleSheet(f"background:{HtsColors.SELL};")
-            sell_btn.clicked.connect(lambda _, p=price: self._order_from_book("매도", p))
-            buy_btn = QPushButton("매수")
-            buy_btn.setStyleSheet(f"background:{HtsColors.BUY};")
-            buy_btn.clicked.connect(lambda _, p=price: self._order_from_book("매수", p))
-
-            self.order_book_table.setCellWidget(row, 0, sell_btn)
-            self._set_table_text(self.order_book_table, row, 1, f"{ask_qty:,}" if ask_qty else "")
+            self.order_book_table.setRowHeight(row, 16)
+            self._set_order_book_item(row, 0, f"{sell_order_qty:,}" if sell_order_qty else "", "#dbeafe")
+            self._set_order_book_item(row, 1, f"{ask_qty:,}" if ask_qty else "", "#eff6ff")
             price_item = self._table_item(f"{price:,}")
-            if row < mid:
+            price_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            price_item.setBackground(QColor("#fff7ed" if row == mid else "#ffffff"))
+            price_item.setFont(QFont("Consolas", 8, QFont.Bold))
+            if is_previous_close:
+                price_item.setForeground(QColor("#111827"))
+            elif price > stock.previous_close:
                 price_item.setForeground(QColor(HtsColors.BUY))
-            elif row > mid:
+            else:
                 price_item.setForeground(QColor(HtsColors.SELL))
             self.order_book_table.setItem(row, 2, price_item)
-            self._set_table_text(self.order_book_table, row, 3, f"{bid_qty:,}" if bid_qty else "")
-            self.order_book_table.setCellWidget(row, 4, buy_btn)
-
-    def _refresh_chart(self) -> None:
-        stock = self.stocks[self.active_code]
-        history = stock.history[-30:]
-        self.chart_table.setRowCount(len(history))
-        for row, price in enumerate(history):
-            self._set_table_text(self.chart_table, row, 0, str(row + 1))
-            self._set_table_text(self.chart_table, row, 1, f"{price:,}")
+            self._set_order_book_item(row, 3, f"{change_rate:+.2f}", "#ffffff", change, is_previous_close)
+            self._set_order_book_item(row, 4, f"{bid_qty:,}" if bid_qty else "", "#fef2f2")
+            self._set_order_book_item(row, 5, f"{buy_order_qty:,}" if buy_order_qty else "", "#fee2e2")
 
     def _refresh_portfolio(self) -> None:
         self.portfolio_table.setRowCount(len(self.positions))
@@ -680,6 +737,32 @@ class AutoStockHts(QMainWindow):
                 if col == 5:
                     self._color_item_by_number(item, pnl)
                 self.portfolio_table.setItem(row, col, item)
+
+    def _refresh_order_holdings(self) -> None:
+        self.order_holdings_table.setRowCount(4)
+        holdings = list(self.positions.items())[:4]
+        for row in range(4):
+            self.order_holdings_table.setRowHeight(row, 16)
+            if row >= len(holdings):
+                for col in range(4):
+                    self._set_table_text(self.order_holdings_table, row, col, "")
+                continue
+            code, pos = holdings[row]
+            stock = self.stocks.get(code)
+            current = stock.price if stock else int(pos["avg"])
+            qty = int(pos["qty"])
+            values = [
+                str(pos["name"]),
+                f"{qty:,}",
+                f"{current:,}",
+                f"{qty * current:,}",
+            ]
+            for col, value in enumerate(values):
+                item = self._table_item(value)
+                item.setFont(QFont("Malgun Gothic", 8))
+                if col:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.order_holdings_table.setItem(row, col, item)
 
     def _refresh_account_summary(self) -> None:
         stock_value = 0
@@ -698,21 +781,85 @@ class AutoStockHts(QMainWindow):
         )
 
     def _order_from_book(self, side: str, price: int) -> None:
-        self.side_combo.setCurrentText(side)
-        self.price_spin.setValue(price)
-        self._submit_ticket(side)
+        self._submit_ticket(side, price)
 
-    def _submit_ticket(self, side: Optional[str] = None) -> None:
-        code = self.ticket_code.text().strip().upper()
+    def _handle_order_book_click(self, row: int, col: int) -> None:
+        if self.skip_next_order_book_click:
+            self.skip_next_order_book_click = False
+            return
+        if col not in (0, 5):
+            return
+        price = self.order_book_prices.get(row)
+        if price is None:
+            return
+        self._order_from_book("매도" if col == 0 else "매수", price)
+
+    def _order_cancel_drag_candidate(self, pos):
+        row = self.order_book_table.rowAt(pos.y())
+        col = self.order_book_table.columnAt(pos.x())
+        if row < 0 or col not in (0, 5):
+            return None
+        price = self.order_book_prices.get(row)
+        if price is None:
+            return None
+        side = "매도" if col == 0 else "매수"
+        qty = self.book_order_qty.get(self.active_code, {}).get(side, {}).get(price, 0)
+        if qty <= 0:
+            return None
+        index = self.order_book_table.model().index(row, col)
+        return {
+            "code": self.active_code,
+            "side": side,
+            "price": price,
+            "qty": qty,
+            "rect": self.order_book_table.visualRect(index),
+        }
+
+    def _request_book_order_cancel(self, code: str, side: str, price: int, qty: int) -> None:
+        stock = self.stocks.get(code)
+        name = stock.name if stock else code
+        msg = f"{name}({code}) {side} {qty:,}주 / {price:,}원 주문을 취소 요청하시겠습니까?"
+        if QMessageBox.question(self, "주문 취소 확인", msg) != QMessageBox.Yes:
+            return
+
+        by_side = self.book_order_qty.get(code, {}).get(side, {})
+        by_side.pop(price, None)
+        cancel_order = {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "no": f"C{self.order_seq:06d}",
+            "code": code,
+            "side": side,
+            "qty": f"{qty}",
+            "price": f"{price}",
+            "status": "취소요청",
+            "env": self.env_combo.currentText(),
+        }
+        self.order_seq += 1
+        self.orders.insert(0, cancel_order)
+        self._refresh_order_book()
+        self._refresh_orders_table()
+        self.log("주문취소", f"{cancel_order['no']} {msg}")
+
+    def _handle_order_book_slider(self, value: int) -> None:
+        self.order_book_slider_values[self.active_code] = value
+        self._refresh_order_book()
+
+    def _order_book_center_price(self, code: str, current_price: int, unit: int) -> int:
+        anchor = self.order_book_anchor_prices.setdefault(code, current_price)
+        slider_value = self.order_book_slider_values.setdefault(code, 0)
+        return max(unit, anchor + slider_value * unit)
+
+    def _submit_ticket(self, side: Optional[str] = None, price: Optional[int] = None) -> None:
+        code = self.order_symbol_combo.currentText().strip().upper()
         if code not in self.stocks:
             QMessageBox.warning(self, "주문 오류", "등록되지 않은 종목코드입니다.")
             return
-        side = side or self.side_combo.currentText()
-        qty = self.qty_spin.value()
-        price = int(self.price_spin.value())
+        side = side or "매수"
+        qty = 10
+        price = int(price or self.stocks[code].price)
         stock = self.stocks[code]
         amount = qty * price
-        order_type = self.order_type.currentText()
+        order_type = "지정가"
 
         msg = f"{stock.name}({code}) {side} {qty:,}주 / {price:,}원 / {order_type}"
         if QMessageBox.question(self, "주문 확인", msg) != QMessageBox.Yes:
@@ -736,11 +883,18 @@ class AutoStockHts(QMainWindow):
         }
         self.order_seq += 1
         self.orders.insert(0, order)
+        self._record_book_order(code, side, qty, price)
         self._apply_demo_fill(code, side, qty, price)
+        self._refresh_order_book()
         self._refresh_orders_table()
         self._refresh_portfolio()
+        self._refresh_order_holdings()
         self._refresh_account_summary()
         self.log("주문", f"{order['no']} {msg} - {status}")
+
+    def _record_book_order(self, code: str, side: str, qty: int, price: int) -> None:
+        by_side = self.book_order_qty.setdefault(code, {}).setdefault(side, {})
+        by_side[price] = by_side.get(price, 0) + qty
 
     def _apply_demo_fill(self, code: str, side: str, qty: int, price: int) -> None:
         stock = self.stocks[code]
@@ -790,6 +944,33 @@ class AutoStockHts(QMainWindow):
     def _set_table_text(self, table: QTableWidget, row: int, col: int, text: str) -> None:
         table.setItem(row, col, self._table_item(text))
 
+    def _set_order_book_item(
+        self,
+        row: int,
+        col: int,
+        text: str,
+        background: str,
+        value: Optional[float] = None,
+        use_black: bool = False,
+    ) -> None:
+        item = self._table_item(text)
+        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        item.setFont(QFont("Malgun Gothic", 8))
+        item.setBackground(QColor(background))
+        if col in (1, 3, 4):
+            item.setFont(QFont("Consolas", 8))
+        if use_black:
+            item.setForeground(QColor("#111827"))
+        elif value is not None:
+            self._color_item_by_number(item, value)
+        elif col == 0 and text:
+            item.setForeground(QColor(HtsColors.SELL))
+            item.setFont(QFont("Malgun Gothic", 8))
+        elif col == 5 and text:
+            item.setForeground(QColor(HtsColors.BUY))
+            item.setFont(QFont("Malgun Gothic", 8))
+        self.order_book_table.setItem(row, col, item)
+
     def _table_item(self, text: str) -> QTableWidgetItem:
         item = QTableWidgetItem(text)
         item.setTextAlignment(Qt.AlignCenter)
@@ -821,6 +1002,7 @@ class AutoStockHts(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
+    app.setFont(QFont("Malgun Gothic", 8))
     window = AutoStockHts()
     window.show()
     sys.exit(app.exec_())
